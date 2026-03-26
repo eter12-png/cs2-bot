@@ -1,13 +1,13 @@
 import os
 import requests
 import time
+import threading
 from flask import Flask, request
 from urllib.parse import quote
 
 app = Flask(__name__)
 
-# --- GÜVENLİ AYARLAR (Render Panelinden Çekilecek) ---
-# Render Panelinde: Environment -> Add Variable kısmından bunları eklemeyi unutma!
+# --- AYARLAR (Render Environment kısmından okunur) ---
 API_KEY = os.environ.get("CSFLOAT_API")
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 CHAT_ID = os.environ.get("CHAT_ID")
@@ -19,40 +19,56 @@ ITEMS = [
     "Kilowatt Case"
 ]
 
+# Steam'e kendimizi gerçek bir tarayıcı gibi tanıtmak için:
+HEADERS = {
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+}
+
 def send_msg(text):
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     try:
-        requests.post(url, json={"chat_id": CHAT_ID, "text": text, "parse_mode": "Markdown"})
-    except Exception as e:
-        print(f"Telegram Hatası: {e}")
+        requests.post(url, json={"chat_id": CHAT_ID, "text": text, "parse_mode": "Markdown"}, timeout=10)
+    except:
+        pass
 
-def scan_arbitrage(mod):
+def scan_worker(mod):
     mod_text = "CSFloat -> Steam" if mod == "1" else "Steam -> CSFloat"
-    send_msg(f"🔍 *{mod_text}* taraması başladı, lütfen bekleyin...")
+    send_msg(f"🔍 *{mod_text}* taraması başladı...")
     
     best_item = {"name": "Veri Yok", "roi": -100, "alis": 0, "satis": 0}
     profitable_list = []
 
     for item in ITEMS:
         try:
-            # 1. Steam Verisi
+            # 1. STEAM VERİSİ
             s_url = f"https://steamcommunity.com/market/priceoverview/?appid=730&currency=1&market_hash_name={quote(item)}"
-            s_res = requests.get(s_url, timeout=10).json()
-            if not s_res.get('success'): continue
-            s_price = float(s_res.get('lowest_price', '$0').replace('$', '').replace(',', ''))
+            s_res = requests.get(s_url, headers=HEADERS, timeout=15)
             
-            # Steam Ban Yememek İçin Bekleme
-            time.sleep(1.5)
+            if s_res.status_code != 200:
+                print(f"Steam Hatası ({item}): {s_res.status_code}")
+                continue
+                
+            s_data = s_res.json()
+            if not s_data.get('lowest_price'): continue
+            s_price = float(s_data['lowest_price'].replace('$', '').replace(',', ''))
+            
+            time.sleep(2) # Steam engeli yememek için süreyi artırdık
 
-            # 2. CSFloat Verisi
-            f_url = f"https://csfloat.com/api/v1/listings?market_hash_name={quote(item)}&limit=5&sort_by=lowest_price&type=buy_now"
-            f_res = requests.get(f_url, headers={"Authorization": API_KEY}, timeout=10).json()
-            listings = f_res if isinstance(f_res, list) else f_res.get('data', [])
+            # 2. CSFLOAT VERİSİ
+            f_url = f"https://csfloat.com/api/v1/listings?market_hash_name={quote(item)}&limit=1&sort_by=lowest_price&type=buy_now"
+            f_res = requests.get(f_url, headers={"Authorization": API_KEY}, timeout=15)
+            
+            if f_res.status_code != 200:
+                print(f"CSFloat Hatası ({item}): {f_res.status_code}")
+                continue
+                
+            f_data = f_res.json()
+            listings = f_data if isinstance(f_data, list) else f_data.get('data', [])
             
             if not listings: continue
             f_price = listings[0]['price'] / 100
             
-            # Hesaplama
+            # 3. HESAPLAMA
             if mod == "1":
                 alis, satis = f_price, round(s_price * 0.87, 2)
             else:
@@ -67,10 +83,10 @@ def scan_arbitrage(mod):
                 profitable_list.append(f"✅ *{item}*\nROI: %{roi} | Al: ${alis} | Sat: ${satis}")
 
         except Exception as e:
-            print(f"Hata ({item}): {e}")
+            print(f"Detaylı Hata ({item}): {str(e)}")
             continue
 
-    # Final Raporu
+    # SONUÇ GÖNDERME
     if profitable_list:
         report = "🚀 *FIRSATLAR BULUNDU!*\n\n" + "\n\n".join(profitable_list)
         send_msg(report)
@@ -84,19 +100,21 @@ def scan_arbitrage(mod):
 @app.route('/', methods=['POST', 'GET'])
 def webhook():
     if request.method == 'POST':
-        data = request.json
-        if "message" in data and "text" in data["message"]:
-            text = data["message"]["text"]
-            if "1 -" in text:
-                scan_arbitrage("1")
+        data = request.get_json()
+        if data and "message" in data:
+            text = data["message"].get("text", "")
+            
+            if "/start" in text:
+                send_msg("🎮 *CS2 Arbitraj Botu Aktif!*\n\nButonları kullanarak tarama yapabilirsin.")
+            elif "1 -" in text:
+                # Arka planda çalıştır (Thread)
+                threading.Thread(target=scan_worker, args=("1",)).start()
             elif "2 -" in text:
-                scan_arbitrage("2")
-            elif "/start" in text:
-                send_msg("🎮 *CS2 Arbitraj Botu Hazır!*\nButonları kullanarak tarama yapabilirsin.")
+                threading.Thread(target=scan_worker, args=("2",)).start()
+                
         return "OK", 200
     return "Bot is alive!", 200
 
 if __name__ == "__main__":
-    # Render portu otomatik ayarlar
     port = int(os.environ.get("PORT", 10000))
     app.run(host='0.0.0.0', port=port)
